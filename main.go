@@ -1,7 +1,6 @@
 package main
 
 import (
-    "container/list"
     "io"
     "io/ioutil"
     "encoding/json"
@@ -14,106 +13,109 @@ import (
     "time"
 )
 
-// JSON format to persist timestamps
-type JsonFormat struct {
+// address HTTP server listens on
+const ADDRESS = ":8080"
+
+// filename to persist timestamps
+const FILENAME = "requestTimestamps.json"
+
+// duration to keep the timestamps
+const DURATION = "1m"
+
+// struct to hold the timestamps
+type Counter struct {
     Timestamps []time.Time
+    lock *sync.Mutex
 }
 
-// use a list to keep timestamps
-var reqTs = list.New()
+// get amount of timestamps
+func (c *Counter) Len() int {
+    return len(c.Timestamps)
+}
 
-// mutex to synchronize list access
-var lock = new(sync.Mutex)
+// add current timestamp
+func (c *Counter) Inc(d time.Duration) {
+    c.lock.Lock()
 
-// duration for how long to keep the timestamps
-var oneMin, _ = time.ParseDuration("1m")
+    // append current timestamp
+    now := time.Now()
+    c.Timestamps = append(c.Timestamps, now)
 
-// filename to persist timestamps in JSON format
-var filename = "requestTimestamps.json"
-
-// port to listen on
-var listenerPort = ":8080"
-
-// HTTP handler function
-func handleReq(w http.ResponseWriter, r *http.Request) {
-
-    // get current timestamp
-    var now = time.Now()
-
-    // synchronize list access
-    lock.Lock()
-
-    // add current timestamp
-    reqTs.PushBack(now)
-
-    // remove outdated timestamps
     for {
-        ts := reqTs.Front()
-        if ts.Value.(time.Time).Before(now.Add(-oneMin)) {
-            reqTs.Remove(ts)
+        if c.Timestamps[0].Before(now.Add(-d)) {
+            // delete first timestamp
+            copy(c.Timestamps[0:], c.Timestamps[1:])
+            c.Timestamps[len(c.Timestamps)-1] = *new(time.Time)
+            c.Timestamps = c.Timestamps[:len(c.Timestamps)-1]
         } else {
             break
         }
     }
+    c.lock.Unlock()
+}
 
-    // get current amount of timestamps
-    len := reqTs.Len()
+// returns an HTTP handler function
+func getHandler(c *Counter, d time.Duration) func(w http.ResponseWriter, r *http.Request) {
+    return func (w http.ResponseWriter, r *http.Request) {
 
-    // release lock
-    lock.Unlock()
+        // add current timestamp
+        c.Inc(d)
 
-    // write response
-    io.WriteString(w, strconv.Itoa(len) + "\n")
+        // get amount of timestamps
+        len := c.Len()
+
+        // write response
+        io.WriteString(w, strconv.Itoa(len) + "\n")
+    }
+}
+
+// error handler
+func check(e error, isPanic bool) {
+    if e != nil {
+        log.Fatal("%s", e)
+        if isPanic {
+            panic(e)
+        }
+    }
 }
 
 func main() {
 
-    // check if file exists and create it if not
-    _, error := os.Stat(filename)
-    if error != nil {
-        if os.IsNotExist(error) {
-            _, error = os.Create(filename)
-            if error != nil {
-                panic(error)
-            }
-        } else {
-            panic(error)
-        }
-    }
+    // init counter
+    counter := new(Counter)
+    counter.lock = new(sync.Mutex)
 
-    // read from file
-    bytes, error := ioutil.ReadFile(filename)
-    if error != nil {
-        panic(error)
+    // check if file exists and create it if not
+    _, error := os.Stat(FILENAME)
+    if error != nil && os.IsNotExist(error) {
+        _, error = os.Create(FILENAME)
     }
+    check(error, true);
+
+    // read timestamps from file
+    bytes, error := ioutil.ReadFile(FILENAME)
+    check(error, true)
 
     if len(bytes) > 0 {
-
-        // decode timestamps from JSON
-        var jsonData JsonFormat
-        error = json.Unmarshal(bytes, &jsonData)
-        if error != nil {
-            panic(error)
-        }
-
-        // transfer timesamps from array slice to list
-        for i := range jsonData.Timestamps {
-            reqTs.PushBack(jsonData.Timestamps[i])
-        }
+        // decode timestamps from JSON format
+        error = json.Unmarshal(bytes, &counter.Timestamps)
+        check(error, true)
     }
 
-    // create server
-    server := &http.Server {Addr: listenerPort}
+    // create HTTP server
+    server := &http.Server {Addr: ADDRESS}
+
+    // parse duration
+    duration, error := time.ParseDuration(DURATION)
+    check(error, true)
 
     // set handler function to serve on root path
-    http.HandleFunc("/", handleReq)
+    http.HandleFunc("/", getHandler(counter, duration))
 
-    // define and call goroutine to start HTTP server
+    // start HTTP server
     go func() {
         error = server.ListenAndServe()
-        if error != nil {
-            log.Printf("%s", error)
-        }
+        check(error, false)
     }()
 
     // create a channel for signal handler
@@ -125,28 +127,15 @@ func main() {
     // block until a SIGINT is received
     _ = <- c
 
-    // shutdown server gracefully
+    // shutdown HTTP server
     error = server.Shutdown(nil)
-    if error != nil {
-        panic(error)
-    }
+    check(error, false)
 
-    // transfer timestamps from list to array slice for encoding
-    var jsonData JsonFormat
-    for ts := reqTs.Front(); ts != nil; ts = ts.Next() {
-        jsonData.Timestamps = append(jsonData.Timestamps, ts.Value.(time.Time))
-    }
+    // encode timestamps into JSON format
+    bytes, error = json.Marshal(counter.Timestamps)
+    check(error, true)
 
-    // encode timestamps into JSON
-    bytes, error = json.Marshal(jsonData)
-    if error != nil {
-        panic(error)
-    }
-
-    // write to file
-    error = ioutil.WriteFile(filename, bytes, 0666)
-    if error != nil {
-        panic(error)
-    }
-
+    // write timestamps to file
+    error = ioutil.WriteFile(FILENAME, bytes, 0666)
+    check(error, true)
 }
